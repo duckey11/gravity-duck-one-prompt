@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gravity Duck — one prompt, one game</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #101828; height: 100%; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; font-family: system-ui, sans-serif; }
+  #wrap { position: relative; width: min(96vw, 960px); }
+  canvas { display: block; width: 100%; border-radius: 12px; box-shadow: 0 8px 40px rgba(0,0,0,.5); background: #7ec8f7; cursor: pointer; }
+  #hint { color: #cbd5e1; text-align: center; margin-top: 10px; font-size: 14px; }
+  #hint b { color: #fde68a; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="game" width="960" height="540"></canvas>
+  <div id="hint">Press <b>SPACE</b> or <b>CLICK / TAP</b> to flip gravity &middot; <b>R</b> to restart &middot; dodge the pipes, catch the stars</div>
+</div>
+<script>
+'use strict';
+// GRAVITY DUCK — built from one prompt:
+// "Build a tiny browser game where a duck flips gravity to dodge pipes and catch stars."
+const cv = document.getElementById('game');
+const ctx = cv.getContext('2d');
+const W = cv.width, H = cv.height;
+const FLOOR = H - 46, CEIL = 46;
+const GRAV = 1800;            // px/s^2 pulling the duck toward the current "down"
+const FLIP_V = 500;           // kick velocity on flip
+const DUCK_X = 210, DUCK_R = 20;
+const PIPE_W = 64, PIPE_GAP = 182;
+const STAR_R = 13;
+
+let state = 'title';          // title | play | over
+let duck = { y: FLOOR - DUCK_R, vy: 0, down: 1, rot: 0 };
+let pipes = [], stars = [], clouds = [];
+let score = 0, best = +(localStorage.getItem('gravity-duck-best') || 0);
+let speed = 210, spawnT = 0, elapsed = 0, frame = 0;
+let flash = 0;
+
+function reset() {
+  duck = { y: FLOOR - DUCK_R, vy: 0, down: 1, rot: 0 };
+  pipes = []; stars = []; score = 0; speed = 210; spawnT = 0; elapsed = 0; flash = 0;
+  clouds = [];
+  for (let i = 0; i < 5; i++) clouds.push({ x: Math.random() * W, y: 60 + Math.random() * 160, s: 0.6 + Math.random() * 0.9 });
+}
+
+function spawnPipe() {
+  // Gap band placed so it is reachable from either side after a flip.
+  const minTop = CEIL + 70, maxTop = FLOOR - PIPE_GAP - 70;
+  const gapY = minTop + Math.random() * (maxTop - minTop);
+  pipes.push({ x: W + 20, gapY, passed: false });
+  // A star inside the gap, sometimes just above or below it for risk/reward.
+  const starY = gapY + PIPE_GAP / 2 + (Math.random() < 0.5 ? -46 : 46);
+  stars.push({ x: W + 20 + PIPE_W / 2, y: Math.max(CEIL + 30, Math.min(FLOOR - 30, starY)), taken: false });
+}
+
+function flip() {
+  if (state === 'title') { state = 'play'; return; }
+  if (state === 'over') { reset(); state = 'play'; return; }
+  duck.down *= -1;
+  duck.vy = FLIP_V * duck.down; // kick away from the surface the duck just left
+  blip(660);
+}
+
+function gameOver() {
+  state = 'over';
+  flash = 1;
+  if (score > best) { best = score; localStorage.setItem('gravity-duck-best', String(best)); }
+  blip(140);
+}
+
+// Tiny WebAudio blips, no assets needed.
+let AC = null;
+function blip(freq) {
+  try {
+    AC = AC || new (window.AudioContext || window.webkitAudioContext)();
+    const o = AC.createOscillator(), g = AC.createGain();
+    o.type = 'sine'; o.frequency.value = freq;
+    g.gain.setValueAtTime(0.08, AC.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, AC.currentTime + 0.12);
+    o.connect(g); g.connect(AC.destination); o.start(); o.stop(AC.currentTime + 0.13);
+  } catch (e) { /* audio is a garnish, never fatal */ }
+}
+
+function update(dt) {
+  frame++;
+  elapsed += dt;
+  speed = Math.min(340, 210 + elapsed * 3.5);
+  for (const c of clouds) { c.x -= speed * 0.25 * dt; if (c.x < -90) { c.x = W + 60; c.y = 60 + Math.random() * 160; } }
+  if (state !== 'play') { if (flash > 0) flash = Math.max(0, flash - dt * 2); return; }
+
+  duck.vy += GRAV * duck.down * dt;
+  duck.vy = Math.max(-600, Math.min(600, duck.vy)); // terminal velocity: keeps the duck steerable
+  duck.y += duck.vy * dt;
+  const targetRot = duck.down * 0.35 + Math.max(-0.5, Math.min(0.5, duck.vy / 2400));
+  duck.rot += (targetRot - duck.rot) * Math.min(1, dt * 10);
+  if (duck.down === 1 && duck.y > FLOOR - DUCK_R) { duck.y = FLOOR - DUCK_R; duck.vy = 0; }
+  if (duck.down === -1 && duck.y < CEIL + DUCK_R) { duck.y = CEIL + DUCK_R; duck.vy = 0; }
+
+  spawnT -= dt;
+  if (spawnT <= 0) { spawnPipe(); spawnT = 1.35; }
+  for (const p of pipes) p.x -= speed * dt;
+  for (const s of stars) s.x -= speed * dt;
+  pipes = pipes.filter(p => p.x > -PIPE_W - 10);
+  stars = stars.filter(s => s.x > -30 && !s.taken);
+
+  // Scoring + collisions.
+  for (const p of pipes) {
+    if (!p.passed && p.x + PIPE_W < DUCK_X - DUCK_R) { p.passed = true; score += 1; blip(880); }
+    const inX = DUCK_X + DUCK_R - 4 > p.x && DUCK_X - DUCK_R + 4 < p.x + PIPE_W;
+    if (inX && (duck.y - DUCK_R + 4 < p.gapY || duck.y + DUCK_R - 4 > p.gapY + PIPE_GAP)) { gameOver(); return; }
+  }
+  for (const s of stars) {
+    const dx = DUCK_X - s.x, dy = duck.y - s.y;
+    if (!s.taken && dx * dx + dy * dy < (DUCK_R + STAR_R) * (DUCK_R + STAR_R)) {
+      s.taken = true; score += 5; blip(1180);
+    }
+  }
+}
+
+function drawDuck() {
+  ctx.save();
+  ctx.translate(DUCK_X, duck.y);
+  ctx.rotate(duck.rot);
+  ctx.scale(1, duck.down); // flip the sprite with gravity so the duck looks upside-down on the ceiling
+  // body
+  ctx.fillStyle = '#facc15';
+  ctx.beginPath(); ctx.ellipse(0, 0, 22, 17, 0, 0, Math.PI * 2); ctx.fill();
+  // wing
+  ctx.fillStyle = '#eab308';
+  ctx.beginPath(); ctx.ellipse(-4, 2, 11, 7, -0.3, 0, Math.PI * 2); ctx.fill();
+  // head
+  ctx.fillStyle = '#fde047';
+  ctx.beginPath(); ctx.arc(13, -11, 11, 0, Math.PI * 2); ctx.fill();
+  // beak
+  ctx.fillStyle = '#f97316';
+  ctx.beginPath(); ctx.moveTo(22, -13); ctx.lineTo(33, -9); ctx.lineTo(22, -6); ctx.closePath(); ctx.fill();
+  // eye
+  ctx.fillStyle = '#111827';
+  ctx.beginPath(); ctx.arc(16, -14, 2.6, 0, Math.PI * 2); ctx.fill();
+  ctx.restore();
+}
+
+function drawPipe(x, y, h) {
+  ctx.fillStyle = '#16a34a';
+  ctx.fillRect(x, y, PIPE_W, h);
+  ctx.fillStyle = '#15803d';
+  ctx.fillRect(x, y, PIPE_W, 8);
+  ctx.fillStyle = '#22c55e';
+  ctx.fillRect(x + 8, y, 6, h);
+  ctx.fillStyle = '#14532d';
+  ctx.fillRect(x, y + h - 6, PIPE_W, 6);
+}
+
+function drawStar(s) {
+  ctx.save();
+  ctx.translate(s.x, s.y);
+  ctx.rotate(frame * 0.02);
+  ctx.fillStyle = '#fbbf24';
+  ctx.strokeStyle = '#f59e0b'; ctx.lineWidth = 2;
+  ctx.beginPath();
+  for (let i = 0; i < 10; i++) {
+    const r = i % 2 === 0 ? STAR_R : STAR_R * 0.45;
+    const a = -Math.PI / 2 + i * Math.PI / 5;
+    ctx[i === 0 ? 'moveTo' : 'lineTo'](Math.cos(a) * r, Math.sin(a) * r);
+  }
+  ctx.closePath(); ctx.fill(); ctx.stroke();
+  ctx.restore();
+}
+
+function draw() {
+  // sky
+  const sky = ctx.createLinearGradient(0, 0, 0, H);
+  sky.addColorStop(0, '#7ec8f7'); sky.addColorStop(1, '#bae6fd');
+  ctx.fillStyle = sky; ctx.fillRect(0, 0, W, H);
+  for (const c of clouds) {
+    ctx.fillStyle = 'rgba(255,255,255,0.85)';
+    ctx.beginPath();
+    ctx.ellipse(c.x, c.y, 42 * c.s, 16 * c.s, 0, 0, Math.PI * 2);
+    ctx.ellipse(c.x + 26 * c.s, c.y + 4, 30 * c.s, 12 * c.s, 0, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  for (const p of pipes) {
+    drawPipe(p.x, 0, p.gapY);
+    drawPipe(p.x, p.gapY + PIPE_GAP, H - (p.gapY + PIPE_GAP));
+  }
+  for (const s of stars) if (!s.taken) drawStar(s);
+  // ceiling + floor strips
+  ctx.fillStyle = '#92400e'; ctx.fillRect(0, 0, W, CEIL); ctx.fillRect(0, FLOOR, W, H - FLOOR);
+  ctx.fillStyle = '#16a34a'; ctx.fillRect(0, CEIL - 10, W, 10); ctx.fillRect(0, FLOOR, W, 10);
+  drawDuck();
+  // HUD
+  ctx.fillStyle = 'rgba(15,23,42,0.75)';
+  ctx.fillRect(14, 56, 200, 78);
+  ctx.fillStyle = '#fff'; ctx.font = 'bold 24px system-ui, sans-serif'; ctx.textAlign = 'left';
+  ctx.fillText('SCORE ' + score, 26, 86);
+  ctx.fillStyle = '#fde68a'; ctx.font = 'bold 18px system-ui, sans-serif';
+  ctx.fillText('BEST ' + best, 26, 118);
+  if (state === 'title') {
+    ctx.fillStyle = 'rgba(15,23,42,0.55)'; ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#fff'; ctx.font = 'bold 64px system-ui, sans-serif';
+    ctx.fillText('GRAVITY DUCK', W / 2, H / 2 - 50);
+    ctx.fillStyle = '#fde68a'; ctx.font = 'bold 22px system-ui, sans-serif';
+    ctx.fillText('one prompt. one game. flip gravity, dodge pipes, catch stars.', W / 2, H / 2 - 8);
+    ctx.fillStyle = '#fff'; ctx.font = '20px system-ui, sans-serif';
+    ctx.fillText('press SPACE or CLICK to start', W / 2, H / 2 + 34);
+  }
+  if (state === 'over') {
+    ctx.fillStyle = 'rgba(15,23,42,0.55)'; ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#fff'; ctx.font = 'bold 56px system-ui, sans-serif';
+    ctx.fillText('GAME OVER', W / 2, H / 2 - 30);
+    ctx.fillStyle = '#fde68a'; ctx.font = 'bold 26px system-ui, sans-serif';
+    ctx.fillText('score ' + score + '   ·   best ' + best, W / 2, H / 2 + 16);
+    ctx.fillStyle = '#fff'; ctx.font = '20px system-ui, sans-serif';
+    ctx.fillText('press R or CLICK to play again', W / 2, H / 2 + 56);
+  }
+  if (flash > 0) { ctx.fillStyle = 'rgba(239,68,68,' + (flash * 0.35) + ')'; ctx.fillRect(0, 0, W, H); }
+}
+
+let last = performance.now();
+function loop(now) {
+  const dt = Math.min(0.033, (now - last) / 1000);
+  last = now;
+  update(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+
+window.addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.code === 'ArrowUp') { e.preventDefault(); flip(); }
+  if (e.code === 'KeyR' && state === 'over') { reset(); state = 'play'; }
+});
+cv.addEventListener('pointerdown', () => flip());
+reset();
+requestAnimationFrame(loop);
+
+// Hooks the video shoot and tests use to drive and observe the game.
+window.__game = {
+  get state() { return state; },
+  get score() { return score; },
+  get best() { return best; },
+  get duckY() { return duck.y; },
+  get duckVy() { return duck.vy; },
+  get duckDown() { return duck.down; },
+  get nextGap() {
+    const p = pipes.find((p) => p.x + PIPE_W > DUCK_X - DUCK_R);
+    return p ? p.gapY + PIPE_GAP / 2 : null;
+  },
+  start() { if (state === 'title') flip(); },
+  flip,
+  reset() { reset(); state = 'play'; },
+};
+</script>
+</body>
+</html>
